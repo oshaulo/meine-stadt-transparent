@@ -2,7 +2,7 @@ import datetime
 import json
 import logging
 from pathlib import Path
-from typing import Type, Dict, Tuple
+from typing import Type, Dict, Tuple, List, Callable, Any, Iterable
 
 import django.db.models
 from dateutil import tz
@@ -10,7 +10,7 @@ from django.conf import settings
 from django.core.exceptions import MultipleObjectsReturned
 from django.core.management import BaseCommand, CommandParser, CommandError
 from django.core.management.color import no_style
-from django.db import connection
+from django.db import connection, transaction
 
 from importer import json_datatypes
 from importer.functions import fix_sort_date
@@ -36,6 +36,21 @@ office_replaces = {
 honors_replaces = {"Dr.": "", "Pfarrerin": "", "Pfarrer": ""}
 # Assumption: This is older than the oldest data
 fallback_date = datetime.datetime(1997, 1, 1, 0, 0, 0, tzinfo=tz.tzlocal())
+
+field_lists: Dict[Type, List[str]] = {
+    models.AgendaItem: [
+        "key",
+        "position",
+        "name",
+        "consultation_id",
+        "meeting_id",
+        "public",
+        "result",
+        "oparl_id",
+    ]
+}
+
+unique_field_dict: Dict[Type, List[str]] = {models.AgendaItem: ["meeting_id", "title"]}
 
 
 def make_id_map(cls: Type[SoftDeleteModelManager]) -> Dict[int, int]:
@@ -69,6 +84,44 @@ def flush_model(model: Type[django.db.models.Model]):
     connection.ops.execute_sql_flush("default", statements)
 
 
+def incremental_update(
+    current_model: Type[django.db.models.Model],
+    json_objects: Iterable,
+    convert_function: Callable[[Any], Dict[str, Any]],
+):
+    def get_unique(uniquable: Dict[str, Any]) -> tuple:
+        return tuple([uniquable[i] for i in unique_field_dict[models.AgendaItem]])
+
+    db_value_list = current_model.objects.values_list("id", *field_lists[current_model])
+    db_dicts = [dict(zip(field_lists[current_model], i[1:])) for i in db_value_list]
+    db_to_id = {get_unique(i): i[0] for i, j in zip(db_value_list, db_dicts)}
+    db_to_dict = {get_unique(i): j for i, j in zip(db_value_list, db_dicts)}
+
+    for_insert = []
+    for_update = []
+    for csv_agenda_item in json_objects:
+        unique = csv_agenda_item.get_unique()
+        json_dict = convert_function(csv_agenda_item)
+        if unique in db_to_dict:
+            if db_to_dict[unique] == json_dict:
+                # Existing, identical
+                continue
+            else:
+                # Existing, changed
+                for_update.append((db_to_id[unique], json_dict))
+        else:
+            # New
+            for_insert.append(current_model(**json_dict))
+
+    logger.info(f"Updating {len(for_update)} {current_model.__name__}")
+    with transaction.atomic():
+        for pk, json_object in for_update:
+            current_model.objects.filter(pk=pk).update(**json_object)
+
+    logger.info(f"Creating {len(for_insert)} {current_model.__name__}")
+    current_model.objects.bulk_create(for_insert, 100)
+
+
 def convert_agenda_item(
     consultation_map: Dict[Tuple[int, int], int],
     csv_agenda_item: json_datatypes.AgendaItem,
@@ -85,16 +138,16 @@ def convert_agenda_item(
             paper_id_map.get(csv_agenda_item.paper_original_id),
         )
     )
-    return models.AgendaItem(
-        key=csv_agenda_item.key[:20],  # TODO: Better normalization
-        position=csv_agenda_item.position,
-        name=csv_agenda_item.name,
-        consultation_id=consultation,
-        meeting_id=meeting_id_map[csv_agenda_item.meeting_id],
-        public=True,
-        result=result,
-        oparl_id=csv_agenda_item.original_id,
-    )
+    return {
+        "key": csv_agenda_item.key[:20],  # TODO: Better normalization
+        "position": csv_agenda_item.position,
+        "name": csv_agenda_item.name,
+        "consultation_id": consultation,
+        "meeting_id": meeting_id_map[csv_agenda_item.meeting_id],
+        "public": True,
+        "result": result,
+        "oparl_id": csv_agenda_item.original_id,
+    }
 
 
 def convert_consultation(
@@ -390,14 +443,14 @@ class Command(BaseCommand):
         meeting_id_map: Dict[int, int],
         paper_id_map: Dict[int, int],
     ):
-        logger.info(f"Importing {len(ris_data.agenda_items)} agenda items")
-        db_agenda_items = [
-            convert_agenda_item(
-                consultation_map, csv_agenda_item, meeting_id_map, paper_id_map
+        logger.info(f"Processing {len(ris_data.agenda_items)} agenda items")
+
+        def convert_function(x):
+            return convert_agenda_item(
+                x, consultation_map, meeting_id_map, paper_id_map
             )
-            for csv_agenda_item in ris_data.agenda_items
-        ]
-        models.AgendaItem.objects.bulk_create(db_agenda_items, 100)
+
+        incremental_update(models.AgendaItem, ris_data.agenda_items, convert_function)
 
     def import_consultations(
         self,
